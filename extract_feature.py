@@ -37,26 +37,14 @@ def arguments():
     # parser.add_argument('--split', default='train2014', help='train2014, val2014')
     # parser.add_argument('--batchsize', default=4, type=int, help='batch_size')
     parser.add_argument(
-        "--model",
-        default="res5",
-        type=str,
-        help='options: "res4", "res5"; features come from)',
-    )
-    parser.add_argument(
-        "--weight",
-        default="vg",
-        type=str,
-        help="option: mask, obj, vg. mask:mask_rcnn on COCO, obj: faster_rcnn on COCO, vg: faster_rcnn on Visual Genome",
-    )
-    parser.add_argument(
         "-i", "--input_json", default="data/dataset_flickr8k.json", help=""
     )
     parser.add_argument(
         "--data_folder",
-        default="data/train",
+        default="data/Images",
         help="",
     )
-    parser.add_argument("--out_folder", default="flickr8k_talk_box", help="")
+    parser.add_argument("--out_folder", default="feature_out", help="")
     return parser.parse_args()
 
 
@@ -143,7 +131,7 @@ def fast_rcnn_inference_single_image(
     max_scores, max_classes = scores.max(1)  # R x C --> R
     num_objs = boxes.size(0)
     boxes = boxes.view(-1, 4)
-    idxs = torch.arange(num_objs).cpu() * num_bbox_reg_classes + max_classes
+    idxs = torch.arange(num_objs).cuda() * num_bbox_reg_classes + max_classes
     max_boxes = boxes[idxs]  # Select max boxes according to the max scores.
 
     # Apply NMS
