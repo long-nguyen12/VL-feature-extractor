@@ -234,11 +234,23 @@ def gen_feature(args):
     detector = build_model()
     os.makedirs(os.path.join(args.out_folder), exist_ok=True)
 
-    for i, img in enumerate(tqdm(glob(args.data_folder + "/*"))):
-        _img_path = img
-        img = img.split("\\")
-        filename = img[-1].split(".")[0]
-        im0 = cv2.imread(_img_path)
+    if not os.path.exists(args.input_json):
+        print("Error: invalid json file.")
+
+    imgs = json.load(open(args.input_json, "r"))
+    imgs = imgs["images"]
+
+    for i, img in enumerate(tqdm(imgs)):
+        # _img_path = img
+        # img = img.split("\\")
+        # filename = img[-1].split(".")[0]
+        # im0 = cv2.imread(_img_path)
+        filename = img["filename"].split(".")[0]
+        image_id = img["imgid"]
+
+        im0 = cv2.imread(
+            str(Path(os.path.join(args.data_folder, filename)).with_suffix(".jpg"))
+        )
         h, w, _ = im0.shape
 
         instances_list, features_list = doit(detector, im0)
@@ -249,7 +261,7 @@ def gen_feature(args):
         num_objects = len(instances)
         image_bboxes = instances.pred_boxes.tensor.numpy()
         info = {
-            "image_id": filename,
+            "image_id": image_id,
             "image_h": h,
             "image_w": w,
             "objects_id": instances.pred_classes.numpy(),  # int64
