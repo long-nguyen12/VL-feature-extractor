@@ -260,7 +260,7 @@ def gen_feature(args):
             # "boxes": base64.b64encode(instances.pred_boxes.tensor.numpy()).decode(),  # float32
             # "features": base64.b64encode(features.numpy()).decode()  # float32
         }
-        output_file = os.path.join(args.out_folder, str(filename))
+        output_file = os.path.join(args.out_folder, str(image_id))
         np.savez_compressed(
             output_file,
             features=features,
