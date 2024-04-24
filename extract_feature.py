@@ -5,6 +5,7 @@ import shutil
 import sys
 from glob import glob
 from pathlib import Path
+from typing import Tuple
 
 import cv2
 import numpy as np
@@ -12,18 +13,13 @@ import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 
-# from demo.detectron2_mscoco_proposal_maxnms import build_model
 import detectron2
 from detectron2.config import CfgNode as CN
 from detectron2.config.config import get_cfg
 from detectron2.engine.defaults import DefaultPredictor
-from detectron2.layers import nms
+from detectron2.layers import batched_nms, nms
 from detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.modeling.postprocessing import detector_postprocess
-from detectron2.modeling.roi_heads.fast_rcnn import (
-    FastRCNNOutputLayers,
-    fast_rcnn_inference,
-)
 from detectron2.structures.boxes import Boxes
 from detectron2.structures.instances import Instances
 
@@ -34,8 +30,6 @@ MAX_BOXES = 100
 
 def arguments():
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--split', default='train2014', help='train2014, val2014')
-    # parser.add_argument('--batchsize', default=4, type=int, help='batch_size')
     parser.add_argument(
         "-i", "--input_json", default="data/dataset_flickr8k.json", help=""
     )
@@ -52,38 +46,72 @@ def build_model():
     # Build model and load weights.
     print("Load the Faster RCNN weight for ResNet101, pretrained on MS COCO detection.")
     cfg = get_cfg()
-    cfg.set_new_allowed(True)
-    cfg.merge_from_file("configs/SwinT/faster_rcnn_swint_T_FPN_3x_.yaml")
+    # cfg.set_new_allowed(True)
+    cfg.merge_from_file("configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # set threshold for this model
-    cfg.MODEL.WEIGHTS = "pretrained/faster_rcnn_swint_T.pth"
+    cfg.MODEL.WEIGHTS = "pretrained/model_final_f6e8b1.pkl"
 
-    cfg.MODEL.SWINT = CN()
-    cfg.MODEL.SWINT.EMBED_DIM = 96
-    cfg.MODEL.SWINT.OUT_FEATURES = ["stage2", "stage3", "stage4", "stage5"]
-    cfg.MODEL.SWINT.DEPTHS = [2, 2, 6, 2]
-    cfg.MODEL.SWINT.NUM_HEADS = [3, 6, 12, 24]
-    cfg.MODEL.SWINT.WINDOW_SIZE = 7
-    cfg.MODEL.SWINT.MLP_RATIO = 4
-    cfg.MODEL.SWINT.DROP_PATH_RATE = 0.2
-    cfg.MODEL.SWINT.APE = False
-    cfg.MODEL.BACKBONE.FREEZE_AT = -1
+    # cfg.MODEL.SWINT = CN()
+    # cfg.MODEL.SWINT.EMBED_DIM = 96
+    # cfg.MODEL.SWINT.OUT_FEATURES = ["stage2", "stage3", "stage4", "stage5"]
+    # cfg.MODEL.SWINT.DEPTHS = [2, 2, 6, 2]
+    # cfg.MODEL.SWINT.NUM_HEADS = [3, 6, 12, 24]
+    # cfg.MODEL.SWINT.WINDOW_SIZE = 7
+    # cfg.MODEL.SWINT.MLP_RATIO = 4
+    # cfg.MODEL.SWINT.DROP_PATH_RATE = 0.2
+    # cfg.MODEL.SWINT.APE = False
+    # cfg.MODEL.BACKBONE.FREEZE_AT = -1
 
     detector = DefaultPredictor(cfg)
     return detector
 
 
-def predict_boxes(predictions, proposals):
-    """
-    Args:
-        predictions: return values of :meth:`forward()`.
-        proposals (list[Instances]): proposals that match the features that were
-            used to compute predictions. The ``proposal_boxes`` field is expected.
+def fast_rcnn_inference_single_image(
+    boxes,
+    scores,
+    image_shape: Tuple[int, int],
+    score_thresh: float,
+    nms_thresh: float,
+    topk_per_image: int,
+):
+    valid_mask = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores).all(dim=1)
+    if not valid_mask.all():
+        boxes = boxes[valid_mask]
+        scores = scores[valid_mask]
 
-    Returns:
-        list[Tensor]: A list of Tensors of predicted class-specific or class-agnostic boxes
-            for each image. Element i has shape (Ri, K * B) or (Ri, B), where Ri is
-            the number of proposals for image i and B is the box dimension (4 or 5)
-    """
+    scores = scores[:, :-1]
+    num_bbox_reg_classes = boxes.shape[1] // 4
+    # Convert to Boxes to use the `clip` function ...
+    boxes = Boxes(boxes.reshape(-1, 4))
+    boxes.clip(image_shape)
+    boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)  # R x C x 4
+
+    # 1. Filter results based on detection scores. It can make NMS more efficient
+    #    by filtering out low-confidence detections.
+    filter_mask = scores > score_thresh  # R x K
+    # R' x 2. First column contains indices of the R predictions;
+    # Second column contains indices of classes.
+    filter_inds = filter_mask.nonzero()
+    if num_bbox_reg_classes == 1:
+        boxes = boxes[filter_inds[:, 0], 0]
+    else:
+        boxes = boxes[filter_mask]
+    scores = scores[filter_mask]
+
+    # 2. Apply NMS for each class independently.
+    keep = batched_nms(boxes, scores, filter_inds[:, 1], nms_thresh)
+    if topk_per_image >= 0:
+        keep = keep[:topk_per_image]
+    boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
+
+    result = Instances(image_shape)
+    result.pred_boxes = Boxes(boxes)
+    result.scores = scores
+    result.pred_classes = filter_inds[:, 1]
+    return result, filter_inds[:, 0]
+
+
+def predict_boxes(predictions, proposals):
     cfg = get_cfg()
     if not len(proposals):
         return []
@@ -101,51 +129,10 @@ def predict_boxes(predictions, proposals):
 
 
 def predict_probs(predictions, proposals):
-    """
-    Args:
-        predictions: return values of :meth:`forward()`.
-        proposals (list[Instances]): proposals that match the features that were
-            used to compute predictions.
-
-    Returns:
-        list[Tensor]: A list of Tensors of predicted class probabilities for each image.
-            Element i has shape (Ri, K + 1), where Ri is the number of proposals for image i.
-    """
     scores, _ = predictions
     num_inst_per_image = [len(p) for p in proposals]
     probs = F.softmax(scores, dim=-1)
     return probs.split(num_inst_per_image, dim=0)
-
-
-def fast_rcnn_inference_single_image(
-    boxes, scores, image_shape, score_thresh, nms_thresh, topk_per_image
-):
-    scores = scores[:, :-1]
-    num_bbox_reg_classes = boxes.shape[1] // 4
-    # Convert to Boxes to use the `clip` function ...
-    boxes = Boxes(boxes.reshape(-1, 4))
-    boxes.clip(image_shape)
-    boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)  # R x C x 4
-
-    # Select max scores
-    max_scores, max_classes = scores.max(1)  # R x C --> R
-    num_objs = boxes.size(0)
-    boxes = boxes.view(-1, 4)
-    idxs = torch.arange(num_objs).cuda() * num_bbox_reg_classes + max_classes
-    max_boxes = boxes[idxs]  # Select max boxes according to the max scores.
-
-    # Apply NMS
-    keep = nms(max_boxes, max_scores, nms_thresh)
-    if topk_per_image >= 0:
-        keep = keep[:topk_per_image]
-    boxes, scores = max_boxes[keep], max_scores[keep]
-
-    result = Instances(image_shape)
-    result.pred_boxes = Boxes(boxes)
-    result.scores = scores
-    result.pred_classes = max_classes[keep]
-
-    return result, keep
 
 
 def doit(detector, raw_image):
@@ -161,21 +148,12 @@ def doit(detector, raw_image):
         proposals, _ = detector.model.proposal_generator(images, features, None)
 
         # Run RoI head for each proposal (RoI Pooling + Res5)
-        # proposal_boxes = [x.proposal_boxes for x in proposals]
-        # features = [features[f] for f in detector.model.roi_heads.in_features]
         predictions, box_features = detector.model.roi_heads(
             images, features, proposals
         )
         feature_pooled = box_features.mean(
             dim=[2, 3]
         )  # (sum_proposals, 2048), pooled to 1x1
-        print(feature_pooled.shape)
-        # Predict classes and boxes for each proposal.
-        # pred_class_logits, pred_proposal_deltas = (
-        #     detector.model.roi_heads.box_predictor(feature_pooled)
-        # )
-        # print(pred_class_logits)
-        rcnn_outputs = predictions
 
         # Fixed-number NMS
         instances_list, ids_list = [], []
@@ -229,10 +207,6 @@ def gen_feature(args):
     imgs = imgs["images"]
 
     for i, img in enumerate(tqdm(imgs)):
-        # _img_path = img
-        # img = img.split("\\")
-        # filename = img[-1].split(".")[0]
-        # im0 = cv2.imread(_img_path)
         filename = img["filename"].split(".")[0]
         image_id = img["imgid"]
 
@@ -245,7 +219,6 @@ def gen_feature(args):
         instances = instances_list[0].to("cpu")
         features = features_list[0].to("cpu")
 
-        print("features.shape", features.shape)
         num_objects = len(instances)
         image_bboxes = instances.pred_boxes.tensor.numpy()
         info = {
@@ -270,6 +243,7 @@ def gen_feature(args):
             image_w=w,
             info=info,
         )
+        break
 
 
 if __name__ == "__main__":
