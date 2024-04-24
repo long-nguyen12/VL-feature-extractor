@@ -243,7 +243,6 @@ def gen_feature(args):
             image_w=w,
             info=info,
         )
-        break
 
 
 if __name__ == "__main__":
